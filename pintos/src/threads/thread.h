@@ -5,7 +5,11 @@
 #include <list.h>
 #include <stdint.h>
 #include <threads/synch.h>
+#include "vm/page.h"
+#include "lib/kernel/hash.h"
 
+typedef int mapid_t;
+typedef int pid_t;
 /* States in a thread's life cycle. */
 enum thread_status
   {
@@ -103,7 +107,14 @@ struct thread
 
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
-    uint32_t *pagedir;                  /* Page directory. */
+    uint32_t *pagedir;
+
+    /* Page directory. */
+    struct hash suppl_page_table;
+
+    /* Memory Maped Files table */
+    mapid_t mapid_allocator;
+    struct hash mmfiles;
 #endif
 
     /* Owned by thread.c. */
@@ -120,7 +131,7 @@ struct thread
     struct list files;// the list of opened files
     struct file * executable; // the thread executable file 
     int max_fd; // the file descriptor used by the thread
-  };
+};
 
 
 
@@ -165,5 +176,7 @@ void release_file_lock(void);
 
 
 int child_thread_wait(int);
+
+struct thread * thread_get_by_id (tid_t);
 
 #endif /* threads/thread.h */

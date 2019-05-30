@@ -5,8 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <devices/timer.h>
-#include <threads/malloc.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
 #include "userprog/tss.h"
@@ -17,11 +15,44 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/malloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "devices/timer.h"
+#include "userprog/syscall.h"
+#include "vm/frame.h"
+
+struct mmfile
+{
+    mapid_t mapid;
+    struct file* file;
+    void * start_addr;
+    unsigned pg_cnt;
+    struct hash_elem elem;
+};
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+
+
+/* Functionalities required by memory mapped files hash table */
+/* Returns a hash value. */
+unsigned mmfile_hash (const struct hash_elem *, void *);
+/* Returns true if mmfile a's mapid is less than b's */
+bool mmfile_less (const struct hash_elem *, const struct hash_elem *, void *);
+
+/* Functionalities for memory mapped files table*/
+/* free the memory mapped files table */
+void free_mmfiles (struct hash *);
+/* Helper function for free_mmfiles, used to free resources for each entry
+   represented by a hash_elem */
+static void free_mmfiles_entry (struct hash_elem *, void *);
+/* The real release of the the resources is done in this function, which
+   includes all the pages in supplemental page table */
+static void mmfiles_free_entry (struct mmfile* mmf_ptr);
+/* Allocate a new unique mapid */
+static mapid_t alloc_mapid (void);
+
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -39,7 +70,7 @@ process_execute (const char *file_name)
 
   char *fn_copy = malloc(len + 1);
   char *fn_copy2 = malloc(len + 1);
-  
+
   memcpy(fn_copy, file_name, len + 1);
   memcpy(fn_copy2, fn_copy, len + 1);
   /* Create a new thread to execute FILE_NAME. */
@@ -58,6 +89,7 @@ process_execute (const char *file_name)
   return tid;
 }
 
+
 /* A thread function that loads a user process and starts it
    running. */
 static void
@@ -69,6 +101,13 @@ start_process (void *file_name_)
 
   char *fn_copy = malloc(strlen(file_name) + 1);
   strlcpy(fn_copy, file_name, strlen(file_name) + 1);
+
+  struct thread *cur = thread_current ();
+  struct thread *parent;
+  /* init supplemental hash page table */
+  hash_init (&cur->suppl_page_table, suppl_pt_hash, suppl_pt_less, NULL);
+  /* init memory mapped files table */
+  hash_init (&cur->mmfiles, mmfile_hash, mmfile_less, NULL);
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -82,9 +121,7 @@ start_process (void *file_name_)
   // put the argument in the stack as the decreasing address order
   int argc = 0;
   int argv[128];
-  
-  struct thread *cur = thread_current();
-  
+
   // lock the executable file that belongs to thread_current()
   acquire_file_lock();
   cur->executable = filesys_open(token);
@@ -142,7 +179,6 @@ start_process (void *file_name_)
    child of the calling process, or if process_wait() has already
    been successfully called for the given TID, returns -1
    immediately, without waiting.
-
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
@@ -156,25 +192,31 @@ process_wait (tid_t child_tid UNUSED)
 void
 process_exit (void)
 {
-  struct thread *cur = thread_current ();
-  uint32_t *pd;
+    struct thread *cur = thread_current ();
+    uint32_t *pd;
 
-  /* Destroy the current process's page directory and switch back
-     to the kernel-only page directory. */
-  pd = cur->pagedir;
-  if (pd != NULL)
+
+    /* unmap all the memory mapped files*/
+    free_mmfiles (&cur->mmfiles);
+
+    /* Destroy the current process's page directory and switch back
+       to the kernel-only page directory. */
+    pd = cur->pagedir;
+    if (pd != NULL)
     {
-      /* Correct ordering here is crucial.  We must set
-         cur->pagedir to NULL before switching page directories,
-         so that a timer interrupt can't switch back to the
-         process page directory.  We must activate the base page
-         directory before destroying the process's page
-         directory, or our active page directory will be one
-         that's been freed (and cleared). */
-      cur->pagedir = NULL;
-      pagedir_activate (NULL);
-      pagedir_destroy (pd);
+        /* Correct ordering here is crucial.  We must set
+           cur->pagedir to NULL before switching page directories,
+           so that a timer interrupt can't switch back to the
+           process page directory.  We must activate the base page
+           directory before destroying the process's page
+           directory, or our active page directory will be one
+           that's been freed (and cleared). */
+        cur->pagedir = NULL;
+        pagedir_activate (NULL);
+        pagedir_destroy (pd);
     }
+    /* free the supplemental page table */
+    free_suppl_pt (&cur->suppl_page_table);
 }
 
 /* Sets up the CPU for running user code in the current
@@ -261,6 +303,9 @@ static bool validate_segment (const struct Elf32_Phdr *, struct file *);
 static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
                           uint32_t read_bytes, uint32_t zero_bytes,
                           bool writable);
+static bool load_segment_lazily (struct file *file, off_t ofs, uint8_t *upage,
+                                 uint32_t read_bytes, uint32_t zero_bytes,
+                                 bool writable);
 
 /* Loads an ELF executable from FILE_NAME into the current thread.
    Stores the executable's entry point into *EIP
@@ -431,6 +476,39 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
 }
 
 /* Loads a segment starting at offset OFS in FILE at address
+   UPAGE lazily */
+static bool
+load_segment_lazily (struct file *file, off_t ofs, uint8_t *upage,
+                     uint32_t read_bytes, uint32_t zero_bytes, bool writable)
+{
+    ASSERT ((read_bytes + zero_bytes) % PGSIZE == 0);
+    ASSERT (pg_ofs (upage) == 0);
+    ASSERT (ofs % PGSIZE == 0);
+
+    while (read_bytes > 0 || zero_bytes > 0)
+    {
+        /* Calculate how to fill this page.
+           We will read PAGE_READ_BYTES bytes from FILE
+           and zero the final PAGE_ZERO_BYTES bytes. */
+        size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
+        size_t page_zero_bytes = PGSIZE - page_read_bytes;
+
+        /* Add an file suuplemental page entry to supplemental page table */
+        if (!suppl_pt_insert_file (file, ofs, upage, page_read_bytes,
+                                   page_zero_bytes, writable))
+            return false;
+
+        /* Advance. */
+        read_bytes -= page_read_bytes;
+        zero_bytes -= page_zero_bytes;
+        ofs += page_read_bytes;
+        upage += PGSIZE;
+    }
+    return true;
+
+}
+
+/* Loads a segment starting at offset OFS in FILE at address
    UPAGE.  In total, READ_BYTES + ZERO_BYTES bytes of virtual
    memory are initialized, as follows:
 
@@ -462,14 +540,14 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
       /* Get a page of memory. */
-      uint8_t *kpage = palloc_get_page (PAL_USER);
+      uint8_t *kpage = vm_allocate_frame (PAL_USER);
       if (kpage == NULL)
         return false;
 
       /* Load this page. */
       if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
         {
-          palloc_free_page (kpage);
+            vm_free_frame (kpage);
           return false;
         }
       memset (kpage + page_read_bytes, 0, page_zero_bytes);
@@ -477,7 +555,7 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       /* Add the page to the process's address space. */
       if (!install_page (upage, kpage, writable))
         {
-          palloc_free_page (kpage);
+            vm_free_frame (kpage);
           return false;
         }
 
@@ -497,14 +575,14 @@ setup_stack (void **esp)
   uint8_t *kpage;
   bool success = false;
 
-  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+  kpage = vm_allocate_frame (PAL_USER | PAL_ZERO);
   if (kpage != NULL)
     {
       success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
       if (success)
         *esp = PHYS_BASE;
       else
-        palloc_free_page (kpage);
+        vm_free_frame (kpage);
     }
   return success;
 }
@@ -527,4 +605,159 @@ install_page (void *upage, void *kpage, bool writable)
      address, then map our page there. */
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
+}
+
+/* Returns a hash value. */
+unsigned
+mmfile_hash (const struct hash_elem *p_, void *aux UNUSED)
+{
+    const struct mmfile *p = hash_entry (p_, struct mmfile, elem);
+    return hash_bytes (&p->mapid, sizeof p->mapid);
+}
+
+/* Returns true if mmfile a's mapid less than b's */
+bool
+mmfile_less (const struct hash_elem *a_, const struct hash_elem *b_,
+             void *aux UNUSED)
+{
+    const struct mmfile *a = hash_entry (a_, struct mmfile, elem);
+    const struct mmfile *b = hash_entry (b_, struct mmfile, elem);
+
+    return a->mapid < b->mapid;
+}
+
+/* Add an entry in memory mapped files table, and add entries in
+   supplemental page table iteratively which is in mmfiles_insert's
+   semantic. */
+mapid_t mmfiles_insert (void *addr, struct file* file, int32_t len)
+{
+    struct thread *t = thread_current ();
+    struct mmfile *mmf;
+    struct hash_elem *result;
+    int offset;
+    int pg_cnt;
+
+    mmf = calloc (1, sizeof *mmf);
+    if (mmf == NULL)
+        return -1;
+
+    mmf->mapid = alloc_mapid ();
+    mmf->file = file;
+    mmf->start_addr = addr;
+
+    /* count how many pages we need to contain the file, and insert a
+       corresponding entry for each file page */
+    offset = 0;
+    pg_cnt = 0;
+    while (len > 0)
+    {
+        size_t read_bytes = len < PGSIZE ? len : PGSIZE;
+        if (!suppl_pt_insert_mmf (file, offset, addr, read_bytes))
+            return -1;
+
+        offset += PGSIZE;
+        len -= PGSIZE;
+        addr += PGSIZE;
+        pg_cnt++;
+    }
+
+    mmf->pg_cnt = pg_cnt;
+
+    result = hash_insert (&t->mmfiles, &mmf->elem);
+    if (result != NULL)
+        return -1;
+
+    return mmf->mapid;
+}
+
+/* Remove the entry in memory mapped files table, and remove corresponding
+   entries in supplemental page table iteratively which is in
+   mmfiles_remove()'s semantic. */
+void
+mmfiles_remove (mapid_t mapping)
+{
+    struct thread *t = thread_current ();
+    struct mmfile mmf;
+    struct mmfile *mmf_ptr;
+    struct hash_elem *he;
+
+    mmf.mapid = mapping;
+    he = hash_delete (&t->mmfiles, &mmf.elem);
+    if (he != NULL)
+    {
+        mmf_ptr = hash_entry (he, struct mmfile, elem);
+        mmfiles_free_entry (mmf_ptr);
+    }
+}
+
+static void
+mmfiles_free_entry (struct mmfile* mmf_ptr)
+{
+    struct thread *t = thread_current ();
+    struct hash_elem *he;
+    int pg_cnt;
+    struct suppl_pte spte;
+    struct suppl_pte *spte_ptr;
+    int offset;
+
+    pg_cnt = mmf_ptr->pg_cnt;
+    offset = 0;
+    while (pg_cnt-- > 0)
+    {
+        /* Get supplemental page table entry for each page */
+        /* check whether the page is dirty */
+        /* if dirty, write back to the file*/
+        /* free the struct suppl_pte for each entry*/
+        spte.uvaddr = mmf_ptr->start_addr + offset;
+        he = hash_delete (&t->suppl_page_table, &spte.elem);
+        if (he != NULL)
+        {
+            spte_ptr = hash_entry (he, struct suppl_pte, elem);
+            if (spte_ptr->is_loaded
+                && pagedir_is_dirty (t->pagedir, spte_ptr->uvaddr))
+            {
+                /* write back to disk */
+                acquire_file_lock();
+                file_seek (spte_ptr->data.mmf_page.file,
+                           spte_ptr->data.mmf_page.ofs);
+                file_write (spte_ptr->data.mmf_page.file,
+                            spte_ptr->uvaddr,
+                            spte_ptr->data.mmf_page.read_bytes);
+                release_file_lock();
+            }
+            free (spte_ptr);
+        }
+        offset += PGSIZE;
+    }
+
+    acquire_file_lock();
+    file_close (mmf_ptr->file);
+    release_file_lock();
+
+    free (mmf_ptr);
+}
+
+
+/* allocate a new unique mapid */
+static mapid_t
+alloc_mapid ()
+{
+    return thread_current ()->mapid_allocator++;
+}
+
+/* free the memory mapped files table */
+void
+free_mmfiles (struct hash *mmfiles)
+{
+    hash_destroy (mmfiles, free_mmfiles_entry);
+}
+
+/* Helper function for free_mmfiles, used to free resources for each entry
+   represented by a hash_elem */
+static void
+free_mmfiles_entry (struct hash_elem *e, void *aux UNUSED)
+{
+    struct mmfile *mmf;
+    mmf = hash_entry (e, struct mmfile, elem);
+    mmfiles_free_entry (mmf);
 }

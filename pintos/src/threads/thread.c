@@ -525,6 +525,10 @@ init_thread (struct thread *t, const char *name, int priority)
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
   intr_set_level (old_level);
+  t->magic = THREAD_MAGIC;
+    #ifdef USERPROG
+        t->mapid_allocator = 0;
+    #endif
 }
 
 /* Allocates a SIZE-byte frame at the top of thread T's stack and
@@ -686,4 +690,20 @@ int child_thread_wait(int child_tid) {
   free(ct);
   
   return status;
+}
+
+struct thread
+*thread_get_by_id (tid_t id)
+{
+    ASSERT (id != TID_ERROR);
+    struct list_elem *e;
+    struct thread *t;
+    e = list_tail (&all_list);
+    while ((e = list_prev (e)) != list_head (&all_list))
+    {
+        t = list_entry (e, struct thread, allelem);
+        if (t->tid == id && t->status != THREAD_DYING)
+            return t;
+    }
+    return NULL;
 }

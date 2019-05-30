@@ -14,16 +14,29 @@
 #include "process.h"
 #include "pagedir.h"
 #include "syscall.h"
+#include "vm/page.h"
+
 
 // syscall array
 syscall_function syscalls[SYSCALL_NUMBER];
 
+
+static uint32_t *esp;
+static void sys_mmap (struct intr_frame * f);
+static void sys_munmap (struct intr_frame * f);
+static bool is_valid_uvaddr (const void *);
+
+
+
 static void syscall_handler (struct intr_frame *);
+
 
 void exit(int exit_status){
   thread_current()->exit_status = exit_status;
   thread_exit ();
 }
+
+
 
 void
 syscall_init (void)
@@ -45,6 +58,8 @@ syscall_init (void)
   syscalls[SYS_SEEK] = sys_seek;
   syscalls[SYS_TELL] = sys_tell;
   syscalls[SYS_CLOSE] = sys_close;
+  syscalls[SYS_MMAP] = sys_mmap;
+  syscalls[SYS_MUNMAP] = sys_munmap;
 }
 
 // check whether page p and p+3 has been in kernel virtual memory
@@ -184,26 +199,78 @@ void sys_read(struct intr_frame * f) {
   int * p =f->esp;
   check_func_args((void *)(p + 1), 3);
   check((void *)*(p + 2));
-
+  unsigned buffer_size = *(f->esp+3);
   int fd = *(p + 1);
   uint8_t * buffer = (uint8_t*)*(p + 2);
-  off_t size = *(p + 3);  
+    uint8_t * buffer_tmp = buffer;
+    unsigned tsize = buffer_size;
+
+    off_t size = *(p + 3);
+
+    while (buffer_tmp != NULL)
+    {
+        if (!is_valid_uvaddr (buffer_tmp))
+            exit (-1);
+
+        if (pagedir_get_page (t->pagedir, buffer_tmp) == NULL)
+        {
+            struct suppl_pte *spte;
+            spte = get_suppl_pte (&t->suppl_page_table,
+                                  pg_round_down (buffer));
+            if (spte != NULL && !spte->is_loaded)
+                load_page (spte);
+            else if (spte == NULL && buffer >= (esp - 32))
+                grow_stack (buffer_tmp);
+            else
+                exit (-1);
+        }
+
+        /* Advance */
+        if (buffer_size == 0)
+        {
+            /* terminate the checking loop */
+            buffer = NULL;
+        }
+        else if (buffer_size > PGSIZE)
+        {
+            buffer += PGSIZE;
+            buffer_size -= PGSIZE;
+        }
+        else
+        {
+            /* last loop */
+            buffer_tmp = buffer + tsize - 1;
+            buffer_size = 0;
+        }
+    }
+
+
+
+
   // read from standard input
-  if (fd == 0) {
+   acquire_file_lock();
+    if (fd == 1) {
+        f->eax = -1;
+        release_file_lock();
+    }
+   else if (fd == 0) {
     for (int i=0; i<size; i++)
       buffer[i] = input_getc();
     f->eax = size;
-  }
+        release_file_lock();
+    }
   else{
     struct file_node * open_f = find_file(&thread_current()->files, *(p + 1));
     // check whether the read file is valid
     if (open_f){
-      acquire_file_lock();
-      f->eax = file_read(open_f->file, buffer, size);
-      release_file_lock();
+        f->eax = file_read(open_f->file, buffer, size);
+        release_file_lock();
+
     } else
-      f->eax = -1;
-  }
+        f->eax = -1;
+        release_file_lock();
+
+    }
 }
 
 void sys_write(struct intr_frame * f) {
@@ -213,20 +280,52 @@ void sys_write(struct intr_frame * f) {
   int fd2 = *(p + 1);
   const char * buffer2 = (const char *)*(p + 2);
   off_t size2 = *(p + 3);
+  unsigned tsize = *(p+3);
+  unsigned buffer_size = tsize;
+  char *buffer_tmp = buffer2;
+
+    while (buffer_tmp != NULL)
+    {
+        if (!is_valid_ptr (buffer_tmp))
+            exit (-1);
+
+        /* Advance */
+        if (buffer_size > PGSIZE)
+        {
+            buffer_tmp += PGSIZE;
+            buffer_size -= PGSIZE;
+        }
+        else if (buffer_size == 0)
+        {
+            /* terminate the checking loop */
+            buffer_tmp = NULL;
+        }
+        else
+        {
+            /* last loop */
+            buffer_tmp = buffer2 + size - 1;
+            buffer_size = 0;
+        }
+    }
   // write to standard output
+  acquire_file_lock();
   if (fd2==1) {
     putbuf(buffer2,size2);
     f->eax = size2;
+    release_file_lock();
+  }else if(fd2==0){
+      f->eax = -1;
+      release_file_lock();
   }
   else{
     struct file_node * openf = find_file(&thread_current()->files, *(p + 1));
     // check whether the write file is valid
     if (openf){
-      acquire_file_lock();
       f->eax = file_write(openf->file, buffer2, size2);
       release_file_lock();
     } else
       f->eax = 0;
+      release_file_lock();
   }
 }
 
@@ -266,4 +365,58 @@ void sys_close(struct intr_frame * f) {
     list_remove(&openf->file_elem);
     free(openf);
   }
+}
+
+void
+sys_mmap (struct intr_frame * f) {
+    int *p = f->esp;
+    int offset;
+    struct thread *t = thread_current();
+    int32_t len;
+    void *addr = (void *) *(esp + 2);
+    check_func_args((void *) (p + 1), 1);
+    struct file_node *open_f = find_file(&thread_current()->files, *(p + 1));
+    if (open_f) {
+        len = file_length(open_f->file);
+        if (len <= 0)
+            f->eax = -1;
+        offset = 0;
+        while (offset < len) {
+            if (get_suppl_pte(&t->suppl_page_table, addr + offset))
+                f->eax = -1;
+
+            if (pagedir_get_page(t->pagedir, addr + offset))
+                f->eax = -1;
+
+            offset += PGSIZE;
+        }
+        acquire_file_lock();
+        struct file *newfile = file_reopen(open_f->file);
+        release_file_lock();
+         f->eax = (newfile == NULL) ? -1 : mmfiles_insert(addr, newfile, len);
+
+    }
+}
+
+void
+sys_munmap (struct intr_frame * f)
+{
+    int * p =f->esp;
+    mmfiles_remove((mapid_t)(*(p+1)));
+}
+static bool
+is_valid_uvaddr (const void *uvaddr)
+{
+    return (uvaddr != NULL && is_user_vaddr (uvaddr));
+}
+
+bool
+is_valid_ptr (const void *usr_ptr)
+{
+    struct thread *cur = thread_current ();
+    if (is_valid_uvaddr (usr_ptr))
+    {
+        return (pagedir_get_page (cur->pagedir, usr_ptr)) != NULL;
+    }
+    return false;
 }
