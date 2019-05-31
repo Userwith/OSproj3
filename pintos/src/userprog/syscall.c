@@ -196,16 +196,16 @@ void sys_filesize(struct intr_frame * f) {
 }
 
 void sys_read(struct intr_frame * f) {
-  int * p =f->esp;
-  check_func_args((void *)(p + 1), 3);
-  check((void *)*(p + 2));
-  unsigned buffer_size = *(f->esp+3);
-  int fd = *(p + 1);
-  uint8_t * buffer = (uint8_t*)*(p + 2);
-    uint8_t * buffer_tmp = buffer;
-    unsigned tsize = buffer_size;
-
+    int * p =f->esp;
+    check_func_args((void *)(p + 1), 3);
+    check((void *)*(p + 2));
+    int fd = *(p + 1);
+    uint8_t * buffer = (uint8_t*)*(p + 2);
     off_t size = *(p + 3);
+    off_t buffer_size = size;
+    uint8_t * buffer_tmp = buffer;
+    struct thread *t = thread_current ();
+
 
     while (buffer_tmp != NULL)
     {
@@ -216,10 +216,10 @@ void sys_read(struct intr_frame * f) {
         {
             struct suppl_pte *spte;
             spte = get_suppl_pte (&t->suppl_page_table,
-                                  pg_round_down (buffer));
+                                  pg_round_down (buffer_tmp));
             if (spte != NULL && !spte->is_loaded)
                 load_page (spte);
-            else if (spte == NULL && buffer >= (esp - 32))
+            else if (spte == NULL && buffer_tmp >= (esp - 32))
                 grow_stack (buffer_tmp);
             else
                 exit (-1);
@@ -229,104 +229,113 @@ void sys_read(struct intr_frame * f) {
         if (buffer_size == 0)
         {
             /* terminate the checking loop */
-            buffer = NULL;
+            buffer_tmp = NULL;
         }
         else if (buffer_size > PGSIZE)
-        {
-            buffer += PGSIZE;
-            buffer_size -= PGSIZE;
-        }
-        else
-        {
-            /* last loop */
-            buffer_tmp = buffer + tsize - 1;
-            buffer_size = 0;
-        }
-    }
-
-
-
-
-  // read from standard input
-   acquire_file_lock();
-    if (fd == 1) {
-        f->eax = -1;
-        release_file_lock();
-    }
-   else if (fd == 0) {
-    for (int i=0; i<size; i++)
-      buffer[i] = input_getc();
-    f->eax = size;
-        release_file_lock();
-    }
-  else{
-    struct file_node * open_f = find_file(&thread_current()->files, *(p + 1));
-    // check whether the read file is valid
-    if (open_f){
-        f->eax = file_read(open_f->file, buffer, size);
-        release_file_lock();
-
-    } else
-        f->eax = -1;
-        release_file_lock();
-
-    }
-}
-
-void sys_write(struct intr_frame * f) {
-  int * p =f->esp;
-  check_func_args((void *)(p + 1), 3);
-  check((void *)*(p + 2));
-  int fd2 = *(p + 1);
-  const char * buffer2 = (const char *)*(p + 2);
-  off_t size2 = *(p + 3);
-  unsigned tsize = *(p+3);
-  unsigned buffer_size = tsize;
-  char *buffer_tmp = buffer2;
-
-    while (buffer_tmp != NULL)
-    {
-        if (!is_valid_ptr (buffer_tmp))
-            exit (-1);
-
-        /* Advance */
-        if (buffer_size > PGSIZE)
         {
             buffer_tmp += PGSIZE;
             buffer_size -= PGSIZE;
         }
-        else if (buffer_size == 0)
+        else
+        {
+            /* last loop */
+            buffer_tmp = buffer + size - 1;
+            buffer_size = 0;
+        }
+    }
+
+
+    // read from standard input
+    if (fd == STDIN_FILENO) {
+        for (int i=0; i<size; i++)
+            buffer[i] = input_getc();
+        f->eax = size;
+    }else if (fd == STDOUT_FILENO)
+    {
+        f->eax = -1;
+    }
+    else{
+        struct file_node * open_f = find_file(&thread_current()->files, *(p + 1));
+        // check whether the read file is valid
+        if (open_f){
+            acquire_file_lock();
+            f->eax = file_read(open_f->file, buffer, size);
+            release_file_lock();
+        } else
+            f->eax = -1;
+    }
+}
+
+
+void sys_write(struct intr_frame * f) {
+    int * p =f->esp;
+    check_func_args((void *)(p + 1), 3);
+    check((void *)*(p + 2));
+    int fd2 = *(p + 1);
+    const char * buffer2 = (const char *)*(p + 2);
+    off_t size2 = *(p + 3);
+    char * buffer_tmp = buffer2;
+    off_t buffer_size = size2;
+    struct thread *t = thread_current ();
+
+
+    while (buffer_tmp != NULL)
+    {
+        if (!is_valid_uvaddr (buffer_tmp))
+            exit (-1);
+
+        if (pagedir_get_page (t->pagedir, buffer_tmp) == NULL)
+        {
+            struct suppl_pte *spte;
+            spte = get_suppl_pte (&t->suppl_page_table,
+                                  pg_round_down (buffer_tmp));
+            if (spte != NULL && !spte->is_loaded)
+                load_page (spte);
+            else if (spte == NULL && buffer_tmp >= (esp - 32))
+                grow_stack (buffer_tmp);
+            else
+                exit (-1);
+        }
+
+        /* Advance */
+        if (buffer_size == 0)
         {
             /* terminate the checking loop */
             buffer_tmp = NULL;
         }
+        else if (buffer_size > PGSIZE)
+        {
+            buffer_tmp += PGSIZE;
+            buffer_size -= PGSIZE;
+        }
         else
         {
             /* last loop */
-            buffer_tmp = buffer2 + size - 1;
+            buffer_tmp = buffer2 + size2 - 1;
             buffer_size = 0;
         }
     }
-  // write to standard output
-  acquire_file_lock();
-  if (fd2==1) {
-    putbuf(buffer2,size2);
-    f->eax = size2;
-    release_file_lock();
-  }else if(fd2==0){
-      f->eax = -1;
-      release_file_lock();
-  }
-  else{
-    struct file_node * openf = find_file(&thread_current()->files, *(p + 1));
-    // check whether the write file is valid
-    if (openf){
-      f->eax = file_write(openf->file, buffer2, size2);
-      release_file_lock();
-    } else
-      f->eax = 0;
-      release_file_lock();
-  }
+
+
+
+
+    // write to standard output
+    if (fd2==STDOUT_FILENO) {
+        putbuf(buffer2,size2);
+        f->eax = size2;
+    } else if(fd2==STDIN_FILENO){
+        f->eax = -1;
+    }
+    else{
+        struct file_node * openf = find_file(&thread_current()->files, *(p + 1));
+        // check whether the write file is valid
+        if (openf){
+            acquire_file_lock();
+            f->eax = file_write(openf->file, buffer2, size2);
+            release_file_lock();
+        } else
+            f->eax = 0;
+    }
 }
 
 void sys_seek(struct intr_frame * f) {
@@ -361,6 +370,7 @@ void sys_close(struct intr_frame * f) {
     acquire_file_lock();
     file_close(openf->file);
     release_file_lock();
+
     // remove file form file list
     list_remove(&openf->file_elem);
     free(openf);
